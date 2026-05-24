@@ -93,6 +93,10 @@ wss.on('connection', (ws, req) => {
   ws.role = null; // 'sharer' | 'receiver' | null
   ws.sessionId = null;
   ws.pairedWith = null;
+  // Native data channels open a SECOND socket that uses native_attach to
+  // bind to an already-established session. We mark those sockets so
+  // handleBinary knows to route between native peers instead of JS peers.
+  ws.isNativeChannel = false;
 
   console.log(`[conn] ${req.socket.remoteAddress} connected`);
 
@@ -116,14 +120,32 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
-    console.log(`[conn] disconnected (code=${ws.code} role=${ws.role})`);
+    console.log(`[conn] disconnected (code=${ws.code} role=${ws.role} native=${ws.isNativeChannel})`);
     if (ws.code) devices.delete(ws.code);
     if (ws.sessionId) {
       const session = sessions.get(ws.sessionId);
       if (session) {
-        const peer = session.sharer === ws ? session.receiver : session.sharer;
-        send(peer, { type: 'peer_disconnected' });
-        sessions.delete(ws.sessionId);
+        if (ws.isNativeChannel) {
+          // Just one half of the native data plane dropped. Don't tear down
+          // the whole session — JS control sockets still own session lifetime.
+          if (session.sharerData === ws) session.sharerData = null;
+          if (session.receiverData === ws) session.receiverData = null;
+          // Tell the peer's native channel its counterpart is gone so it can
+          // stop pumping bytes into the void.
+          const peerData = ws.role === 'sharer' ? session.receiverData : session.sharerData;
+          send(peerData, { type: 'peer_native_disconnected' });
+        } else {
+          // JS control socket dropped — session is over.
+          const peer = session.sharer === ws ? session.receiver : session.sharer;
+          send(peer, { type: 'peer_disconnected' });
+          // Also close any native data channels associated with this session.
+          for (const sock of [session.sharerData, session.receiverData]) {
+            if (sock && sock !== ws) {
+              try { sock.close(1000, 'session ended'); } catch {}
+            }
+          }
+          sessions.delete(ws.sessionId);
+        }
       }
     }
   });
@@ -185,8 +207,10 @@ function handleControl(ws, msg) {
       }
       const sessionId = genSessionId();
       const session = {
-        sharer: ws,
-        receiver,
+        sharer: ws,            // JS control socket (sharer)
+        receiver,              // JS control socket (receiver)
+        sharerData: null,      // native data channel (sharer) — bound via native_attach
+        receiverData: null,    // native data channel (receiver) — bound via native_attach
         startedAt: Date.now(),
         bytesSharer: 0,
         bytesReceiver: 0,
@@ -251,6 +275,42 @@ function handleControl(ws, msg) {
       break;
     }
 
+    case 'native_attach': {
+      // The native VPN/exit services open their own WebSocket and bind it
+      // to an already-established session by deviceId + role. After this,
+      // every binary frame on this socket is forwarded to the OPPOSITE
+      // native channel on the same session.
+      const deviceId = msg.deviceId;
+      const role = msg.role;
+      if (!deviceId || (role !== 'sharer' && role !== 'receiver')) {
+        send(ws, { type: 'native_attach_failed', reason: 'bad_args' });
+        return;
+      }
+      let foundSid = null;
+      let foundSession = null;
+      for (const [sid, s] of sessions) {
+        const jsSock = role === 'sharer' ? s.sharer : s.receiver;
+        if (jsSock && jsSock.deviceId === deviceId) {
+          foundSid = sid;
+          foundSession = s;
+          break;
+        }
+      }
+      if (!foundSession) {
+        send(ws, { type: 'native_attach_failed', reason: 'no_session_for_device' });
+        return;
+      }
+      ws.sessionId = foundSid;
+      ws.role = role;
+      ws.deviceId = deviceId;
+      ws.isNativeChannel = true;
+      if (role === 'sharer') foundSession.sharerData = ws;
+      else foundSession.receiverData = ws;
+      send(ws, { type: 'native_attach_ack', sessionId: foundSid });
+      console.log(`[native_attach] device=${deviceId} role=${role} session=${foundSid}`);
+      break;
+    }
+
     case 'ping':
       send(ws, { type: 'pong', t: Date.now() });
       break;
@@ -267,7 +327,17 @@ function handleBinary(ws, buf) {
   const session = sessions.get(ws.sessionId);
   if (!session) return;
 
-  const peer = session.sharer === ws ? session.receiver : session.sharer;
+  // Pick the peer:
+  //  - native data channel  → forward to the OTHER native data channel
+  //  - JS control socket    → forward to the OTHER JS control socket (legacy)
+  let peer;
+  if (ws.isNativeChannel) {
+    peer = ws.role === 'sharer' ? session.receiverData : session.sharerData;
+  } else {
+    peer = session.sharer === ws ? session.receiver : session.sharer;
+  }
+  if (!peer) return;  // counterpart hasn't attached yet — drop silently
+
   if (ws.role === 'sharer') session.bytesSharer += buf.length;
   else session.bytesReceiver += buf.length;
 
