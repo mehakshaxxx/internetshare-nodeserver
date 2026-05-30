@@ -18,6 +18,7 @@ const WebSocket = require('ws');
 
 const url = 'ws://127.0.0.1:9911';
 process.env.PORT = 9911;
+process.env.CONTROL_REATTACH_GRACE_MS = 1000;
 
 const server = spawn(process.execPath, ['server.js'], {
   cwd: __dirname,
@@ -109,13 +110,28 @@ async function main() {
   const got = await received;
   expect(Buffer.compare(payload, got) === 0, 'binary frame relayed receiver→sharer intact');
 
+  receiver.close();
+  await nextMessage(sharer, m => m.type === 'peer_disconnected');
+
+  const receiver2 = new WebSocket(url);
+  await new Promise(r => receiver2.once('open', r));
+  receiver2.send(JSON.stringify({
+    type: 'resume_session',
+    deviceId: 'receiver-test',
+    sessionId: receiverSession.sessionId,
+    role: 'receiver',
+  }));
+  const resumed = await nextMessage(receiver2, m => m.type === 'session_resumed');
+  expect(resumed.sessionId === receiverSession.sessionId, 'receiver resumes existing session during grace period');
+  await nextMessage(sharer, m => m.type === 'peer_reconnected');
+
   // Tear down.
   sharer.send(JSON.stringify({ type: 'end_session', reason: 'test_done' }));
-  await nextMessage(receiver, m => m.type === 'session_ended');
+  await nextMessage(receiver2, m => m.type === 'session_ended');
   expect(true, 'session_ended propagated to peer');
 
   sharer.close();
-  receiver.close();
+  receiver2.close();
   server.kill();
   console.log('\n✅ all smoke tests passed');
   process.exit(0);

@@ -31,8 +31,9 @@ const HOST = process.env.HOST || '0.0.0.0';
 
 /** code (6-digit string) → { socket, deviceId, mode, pairedWith } */
 const devices = new Map();
-/** sessionId → { sharer: ws, receiver: ws, startedAt, bytesSharer, bytesReceiver, limits } */
+/** sessionId → { sharer: ws|null, receiver: ws|null, startedAt, bytesSharer, bytesReceiver, limits } */
 const sessions = new Map();
+const CONTROL_REATTACH_GRACE_MS = Number(process.env.CONTROL_REATTACH_GRACE_MS || 30_000);
 
 function genCode() {
   // 6-digit numeric code, leading zeros allowed → 1 000 000 combinations.
@@ -58,6 +59,88 @@ function sendBinary(ws, buf) {
   if (ws && ws.readyState === ws.OPEN) {
     ws.send(buf, { binary: true });
   }
+}
+
+function sessionPeer(session, role) {
+  return role === 'sharer' ? session.receiver : session.sharer;
+}
+
+function endSession(sessionId, reason) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  for (const sock of [session.sharer, session.receiver]) {
+    send(sock, { type: 'session_ended', reason });
+    if (sock) sock.sessionId = null;
+  }
+  for (const sock of [session.sharerData, session.receiverData]) {
+    if (sock) {
+      try { sock.close(1000, reason); } catch {}
+    }
+  }
+  if (session.graceTimer) clearTimeout(session.graceTimer);
+  sessions.delete(sessionId);
+}
+
+function scheduleControlGrace(ws) {
+  const sessionId = ws.sessionId;
+  if (!sessionId) return;
+  const session = sessions.get(sessionId);
+  if (!session) return;
+
+  const role = ws.role;
+  if (role === 'sharer' && session.sharer === ws) session.sharer = null;
+  if (role === 'receiver' && session.receiver === ws) session.receiver = null;
+
+  send(sessionPeer(session, role), {
+    type: 'peer_disconnected',
+    role,
+    graceMs: CONTROL_REATTACH_GRACE_MS,
+  });
+
+  if (session.graceTimer) clearTimeout(session.graceTimer);
+  session.graceTimer = setTimeout(() => {
+    const current = sessions.get(sessionId);
+    if (!current) return;
+    if (!current.sharer || !current.receiver) {
+      endSession(sessionId, 'peer_disconnected_timeout');
+    }
+  }, CONTROL_REATTACH_GRACE_MS);
+}
+
+function resumeControlSocket(ws, msg) {
+  const sessionId = String(msg.sessionId || '');
+  const role = msg.role;
+  const deviceId = msg.deviceId;
+  const session = sessions.get(sessionId);
+  if (!session || (role !== 'sharer' && role !== 'receiver') || !deviceId) {
+    send(ws, { type: 'resume_failed', reason: 'bad_session' });
+    return;
+  }
+  const expectedDeviceId = role === 'sharer' ? session.sharerDeviceId : session.receiverDeviceId;
+  if (expectedDeviceId !== deviceId) {
+    send(ws, { type: 'resume_failed', reason: 'device_mismatch' });
+    return;
+  }
+
+  ws.sessionId = sessionId;
+  ws.role = role;
+  ws.deviceId = deviceId;
+  if (role === 'sharer') session.sharer = ws;
+  else session.receiver = ws;
+
+  if (session.graceTimer) {
+    clearTimeout(session.graceTimer);
+    session.graceTimer = null;
+  }
+
+  send(ws, {
+    type: 'session_resumed',
+    sessionId,
+    role,
+    startedAt: session.startedAt,
+    limits: session.limits,
+  });
+  send(sessionPeer(session, role), { type: 'peer_reconnected', role });
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -136,15 +219,7 @@ wss.on('connection', (ws, req) => {
           send(peerData, { type: 'peer_native_disconnected' });
         } else {
           // JS control socket dropped — session is over.
-          const peer = session.sharer === ws ? session.receiver : session.sharer;
-          send(peer, { type: 'peer_disconnected' });
-          // Also close any native data channels associated with this session.
-          for (const sock of [session.sharerData, session.receiverData]) {
-            if (sock && sock !== ws) {
-              try { sock.close(1000, 'session ended'); } catch {}
-            }
-          }
-          sessions.delete(ws.sessionId);
+          scheduleControlGrace(ws);
         }
       }
     }
@@ -214,6 +289,9 @@ function handleControl(ws, msg) {
         startedAt: Date.now(),
         bytesSharer: 0,
         bytesReceiver: 0,
+        sharerDeviceId: ws.deviceId,
+        receiverDeviceId: receiver.deviceId,
+        graceTimer: null,
         limits: {
           durationMs: Number(msg.durationMs) || 0,
           dataLimitBytes: Number(msg.dataLimitBytes) || 0,
@@ -252,14 +330,7 @@ function handleControl(ws, msg) {
 
     case 'end_session': {
       if (!ws.sessionId) return;
-      const session = sessions.get(ws.sessionId);
-      if (!session) return;
-      const peer = session.sharer === ws ? session.receiver : session.sharer;
-      send(peer, { type: 'session_ended', reason: msg.reason || 'peer_ended' });
-      send(ws, { type: 'session_ended', reason: 'self' });
-      sessions.delete(ws.sessionId);
-      ws.sessionId = null;
-      peer.sessionId = null;
+      endSession(ws.sessionId, msg.reason || 'peer_ended');
       break;
     }
 
@@ -289,8 +360,8 @@ function handleControl(ws, msg) {
       let foundSid = null;
       let foundSession = null;
       for (const [sid, s] of sessions) {
-        const jsSock = role === 'sharer' ? s.sharer : s.receiver;
-        if (jsSock && jsSock.deviceId === deviceId) {
+        const expectedDeviceId = role === 'sharer' ? s.sharerDeviceId : s.receiverDeviceId;
+        if (expectedDeviceId === deviceId) {
           foundSid = sid;
           foundSession = s;
           break;
@@ -310,6 +381,10 @@ function handleControl(ws, msg) {
       console.log(`[native_attach] device=${deviceId} role=${role} session=${foundSid}`);
       break;
     }
+
+    case 'resume_session':
+      resumeControlSocket(ws, msg);
+      break;
 
     case 'ping':
       send(ws, { type: 'pong', t: Date.now() });
@@ -345,22 +420,14 @@ function handleBinary(ws, buf) {
   // receiver is actually consuming).
   const limit = session.limits.dataLimitBytes;
   if (limit > 0 && session.bytesReceiver >= limit) {
-    send(session.sharer, { type: 'session_ended', reason: 'data_limit_reached' });
-    send(session.receiver, { type: 'session_ended', reason: 'data_limit_reached' });
-    sessions.delete(ws.sessionId);
-    session.sharer.sessionId = null;
-    session.receiver.sessionId = null;
+    endSession(ws.sessionId, 'data_limit_reached');
     return;
   }
 
   // Enforce duration limit.
   const dur = session.limits.durationMs;
   if (dur > 0 && Date.now() - session.startedAt >= dur) {
-    send(session.sharer, { type: 'session_ended', reason: 'duration_reached' });
-    send(session.receiver, { type: 'session_ended', reason: 'duration_reached' });
-    sessions.delete(ws.sessionId);
-    session.sharer.sessionId = null;
-    session.receiver.sessionId = null;
+    endSession(ws.sessionId, 'duration_reached');
     return;
   }
 
